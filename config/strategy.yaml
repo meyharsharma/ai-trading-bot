@@ -1,0 +1,46 @@
+# Strategy configuration. Tune these — do not hardcode in code.
+
+# Universe
+symbols:
+  - BTC/USD
+  - ETH/USD
+
+# Loop
+loop_interval_seconds: 300   # 5 minutes
+candle_interval: "5m"
+candle_lookback: 200         # bars fetched per loop
+
+# Indicators
+indicators:
+  ma_fast: 20
+  ma_slow: 50
+  rsi_period: 14
+
+# Risk rules — these are HARD limits enforced by the risk gate.
+# Any LLM decision violating these is clamped or rejected.
+risk:
+  max_risk_per_trade_pct: 0.02   # 2% of capital at risk per position
+  max_open_positions: 3
+  max_position_size_pct: 0.25    # no single position > 25% of capital
+  default_stop_loss_pct: 0.03    # 3% stop loss minimum
+  max_stop_loss_pct: 0.08        # never accept stops wider than 8%
+  max_take_profit_pct: 0.20
+  allow_leverage: false
+  allow_shorts: false            # spot only
+
+# LLM
+llm:
+  model: "claude-opus-4-6"
+  max_tokens: 1024
+  temperature: 0.2
+
+# Execution
+execution:
+  mode: "paper"                  # paper | live
+  starting_capital_usd: 1000
+  fee_bps: 26                    # Kraken taker fee ~0.26%
+
+# On-chain
+chain:
+  enabled: true
+  reasoning_storage: "onchain_hash"   # onchain_hash | ipfs
