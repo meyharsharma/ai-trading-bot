@@ -3,10 +3,12 @@ import pytest
 
 from agent.kraken_mcp.client import _extract_payload
 from agent.kraken_mcp.tools import (
+    DEFAULT_TOOL_ALIASES,
     KrakenMCPError,
     OHLCVBar,
     _from_kraken_pair,
     _kraken_pair,
+    _normalize_interval,
     _normalize_ohlcv,
     _normalize_ticker,
     _parse_ts,
@@ -15,12 +17,49 @@ from agent.kraken_mcp.tools import (
 
 # ---------------- pair translation ----------------
 
-def test_kraken_pair_btc_to_xbt():
-    assert _kraken_pair("BTC/USD") == "XBTUSD"
+def test_kraken_pair_btc_passes_through():
+    """The MCP server accepts `BTCUSD` directly. Don't translate to legacy
+    `XBTUSD` form — see workflows/lessons.md."""
+    assert _kraken_pair("BTC/USD") == "BTCUSD"
 
 
 def test_kraken_pair_eth_pass_through():
     assert _kraken_pair("ETH/USD") == "ETHUSD"
+
+
+# ---------------- interval normalization ----------------
+
+def test_normalize_interval_human_to_minutes():
+    assert _normalize_interval("5m") == "5"
+    assert _normalize_interval("1h") == "60"
+    assert _normalize_interval("4h") == "240"
+    assert _normalize_interval("1d") == "1440"
+
+
+def test_normalize_interval_passthrough_digits():
+    assert _normalize_interval("60") == "60"
+    assert _normalize_interval(15) == "15"
+
+
+def test_normalize_interval_rejects_garbage():
+    with pytest.raises(KrakenMCPError):
+        _normalize_interval("banana")
+
+
+# ---------------- alias map covers paper variants ----------------
+
+def test_alias_map_includes_paper_writes():
+    """Guarded mode is the default — the paper_buy/paper_sell logical names
+    must exist so KrakenTools.add_order can resolve them."""
+    assert "paper_buy" in DEFAULT_TOOL_ALIASES
+    assert "paper_sell" in DEFAULT_TOOL_ALIASES
+    assert DEFAULT_TOOL_ALIASES["paper_buy"] == ["kraken_paper_buy"]
+
+
+def test_alias_map_get_open_positions_resolves_to_kraken_positions():
+    """The MCP server uses kraken_positions, not kraken_open_positions."""
+    candidates = DEFAULT_TOOL_ALIASES["get_open_positions"]
+    assert candidates[0] == "kraken_positions"
 
 
 def test_from_kraken_pair_recognizes_kraken_codes():

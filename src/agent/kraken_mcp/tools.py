@@ -26,14 +26,30 @@ from agent.kraken_mcp.client import KrakenMCPClient, KrakenMCPError
 # Logical operation → ordered list of candidate tool names. The first one that
 # the live server advertises (via list_tools) wins. If list_tools returned
 # nothing, we use the first candidate as-is.
+#
+# IMPORTANT: kraken-cli v0.3.0 runs in `guarded` mode by default and does NOT
+# expose `kraken_add_order` / `kraken_cancel_order`. The only writable surface
+# in guarded mode is the `kraken_paper_*` family. We map our `add_order` /
+# `cancel_order` logical names to the paper variants so the loop runs out of
+# the box. If you ever flip Kraken CLI into unguarded mode (real money), the
+# alias resolver will pick the live names automatically because they appear
+# first in each list.
 DEFAULT_TOOL_ALIASES: dict[str, list[str]] = {
-    "get_ohlcv":          ["get_ohlcv", "ohlcv", "get_ohlc", "ohlc", "kraken_ohlc"],
-    "get_ticker":         ["get_ticker", "ticker", "kraken_ticker"],
-    "get_balance":        ["get_balance", "balance", "kraken_balance"],
-    "add_order":          ["add_order", "place_order", "create_order", "kraken_add_order"],
-    "cancel_order":       ["cancel_order", "kraken_cancel_order"],
-    "get_open_orders":    ["get_open_orders", "open_orders", "kraken_open_orders"],
-    "get_open_positions": ["get_open_positions", "open_positions", "kraken_open_positions"],
+    "get_ohlcv":          ["kraken_ohlc", "get_ohlcv", "ohlcv", "get_ohlc", "ohlc"],
+    "get_ticker":         ["kraken_ticker", "get_ticker", "ticker"],
+    "get_balance":        ["kraken_balance", "get_balance", "balance"],
+    "add_order":          ["kraken_add_order", "kraken_paper_buy", "add_order", "place_order", "create_order"],
+    "cancel_order":       ["kraken_cancel_order", "kraken_paper_cancel", "cancel_order"],
+    "get_open_orders":    ["kraken_open_orders", "get_open_orders", "open_orders"],
+    "get_open_positions": ["kraken_positions", "get_open_positions", "open_positions", "kraken_open_positions"],
+    # Paper-trading-specific surface (always present in guarded mode).
+    "paper_init":         ["kraken_paper_init"],
+    "paper_buy":          ["kraken_paper_buy"],
+    "paper_sell":         ["kraken_paper_sell"],
+    "paper_balance":      ["kraken_paper_balance"],
+    "paper_status":       ["kraken_paper_status"],
+    "paper_cancel":       ["kraken_paper_cancel"],
+    "paper_reset":        ["kraken_paper_reset"],
 }
 
 
@@ -75,12 +91,36 @@ class Quote:
         return (self.spread / m) * 10_000.0
 
 
+_INTERVAL_MINUTES: dict[str, int] = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720,
+    "1d": 1440, "1w": 10080, "2w": 21600,
+}
+
+
+def _normalize_interval(interval: str | int) -> str:
+    """Convert ``"5m"``/``"1h"``/``"1d"`` (or an int) into the integer-string-of-minutes
+    that the kraken_ohlc MCP tool expects (``"5"``, ``"60"``, ``"1440"``)."""
+    if isinstance(interval, int):
+        return str(interval)
+    s = interval.strip().lower()
+    if s in _INTERVAL_MINUTES:
+        return str(_INTERVAL_MINUTES[s])
+    # Already a string of digits? Pass it through.
+    if s.isdigit():
+        return s
+    raise KrakenMCPError(f"unsupported interval {interval!r}")
+
+
 def _kraken_pair(symbol: str) -> str:
-    """Translate ``BTC/USD`` → ``XBTUSD`` (Kraken's preferred pair form)."""
-    base, quote = symbol.split("/")
-    if base == "BTC":
-        base = "XBT"
-    return f"{base}{quote}"
+    """Translate ``BTC/USD`` → ``BTCUSD``.
+
+    The Kraken CLI MCP server accepts the human-readable form (`BTCUSD`,
+    `ETHUSD`) directly and handles the asset-code mapping internally. We
+    deliberately do NOT translate to `XBTUSD` here — that's the legacy REST
+    pair name and it's not what the MCP tools expect.
+    """
+    return symbol.replace("/", "")
 
 
 def _from_kraken_pair(pair: str) -> str | None:
@@ -130,7 +170,8 @@ class KrakenTools:
     # ---------------- typed helpers ----------------
 
     async def get_ticker(self, symbol: str) -> dict[str, float]:
-        raw = await self.call("get_ticker", pair=_kraken_pair(symbol))
+        # kraken_ticker takes `pairs` (array). We always ask for one symbol.
+        raw = await self.call("get_ticker", pairs=[_kraken_pair(symbol)])
         return _normalize_ticker(raw)
 
     async def get_ohlcv(
@@ -140,17 +181,31 @@ class KrakenTools:
         limit: int = 200,
         since: int | None = None,
     ) -> list[OHLCVBar]:
-        """Fetch OHLCV bars. ``since`` is a unix-seconds cursor used by
-        ``scripts/pull_history.py`` to paginate past Kraken's per-call cap."""
+        """Fetch OHLCV bars.
+
+        ``interval`` is normalized from human-friendly forms (``"5m"``, ``"1h"``,
+        ``"1d"``) into the integer-string-of-minutes that the MCP tool expects
+        (``"5"``, ``"60"``, ``"1440"``).
+
+        ``limit`` is **not supported** by the kraken_ohlc MCP tool — the server
+        returns a fixed-size window from the most recent data (or from
+        ``since``). We accept the parameter for backwards compatibility with
+        callers but ignore it; downstream slicing happens in Python if needed.
+
+        ``since`` is a unix-seconds cursor used by ``scripts/pull_history.py``
+        to paginate past Kraken's per-call cap.
+        """
         kwargs: dict[str, Any] = {
             "pair": _kraken_pair(symbol),
-            "interval": interval,
-            "limit": limit,
+            "interval": _normalize_interval(interval),
         }
         if since is not None:
-            kwargs["since"] = int(since)
+            kwargs["since"] = str(int(since))
         raw = await self.call("get_ohlcv", **kwargs)
-        return _normalize_ohlcv(raw)
+        bars = _normalize_ohlcv(raw)
+        if limit and len(bars) > limit:
+            bars = bars[-limit:]
+        return bars
 
     async def get_balance(self) -> dict[str, float]:
         raw = await self.call("get_balance")
@@ -172,15 +227,34 @@ class KrakenTools:
         order_type: str = "market",
         price: float | None = None,
     ) -> dict[str, Any]:
+        """
+        Place an order via the Kraken CLI MCP server.
+
+        In `guarded` mode (the default) `add_order` resolves to
+        `kraken_paper_buy` or `kraken_paper_sell` — there is no real-money
+        order tool exposed. We pick the buy/sell tool by side and only pass
+        the args those schemas accept (`pair`, `volume`, optional `type` /
+        `price`). All numeric args are passed as strings; the schemas reject
+        bare numbers.
+        """
+        side_l = side.lower()
+        if side_l not in ("buy", "sell"):
+            raise KrakenMCPError(f"side must be buy|sell, got {side!r}")
+
+        # Prefer the paper-specific logical name when in guarded mode. This
+        # gives the alias resolver a tool that actually exists.
+        logical = "paper_buy" if side_l == "buy" else "paper_sell"
+        if logical not in self._aliases:
+            logical = "add_order"
+
         args: dict[str, Any] = {
             "pair": _kraken_pair(symbol),
-            "type": side.lower(),
-            "ordertype": order_type.lower(),
             "volume": str(quantity),
+            "type": order_type.lower(),
         }
         if price is not None:
             args["price"] = str(price)
-        result = await self.call("add_order", **args)
+        result = await self.call(logical, **args)
         return result if isinstance(result, dict) else {"raw": result}
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
@@ -206,9 +280,16 @@ def _normalize_ticker(raw: Any) -> dict[str, float]:
     if not isinstance(raw, dict):
         raise KrakenMCPError(f"unexpected ticker payload: {type(raw).__name__}")
     payload = raw
-    # Kraken REST style: {"result": {"XXBTZUSD": {...}}, "error": []}
+    # Kraken REST style: {"result": {"XXBTZUSD": {...}}, "error": []}.
     if "result" in payload and isinstance(payload["result"], dict) and payload["result"]:
         payload = next(iter(payload["result"].values()))
+    # Kraken CLI MCP style: result envelope already stripped, payload is
+    # `{"XXBTZUSD": {a, b, c, ...}}`. Descend into the first dict child.
+    elif "b" not in payload and "bid" not in payload:
+        for value in payload.values():
+            if isinstance(value, dict):
+                payload = value
+                break
     bid = _first_number(payload, ["b", "bid", "best_bid"])
     ask = _first_number(payload, ["a", "ask", "best_ask"])
     last = _first_number(payload, ["c", "last", "last_price", "close"])
@@ -247,6 +328,15 @@ def _normalize_ohlcv(raw: Any) -> list[OHLCVBar]:
             rows = raw["ohlc"]
         elif "bars" in raw and isinstance(raw["bars"], list):
             rows = raw["bars"]
+        else:
+            # Kraken CLI MCP shape (result envelope already stripped):
+            #   {"XXBTZUSD": [[ts,o,h,l,c,vwap,vol,count], ...], "last": <ts>}
+            for key, val in raw.items():
+                if key == "last":
+                    continue
+                if isinstance(val, list):
+                    rows = val
+                    break
     elif isinstance(raw, list):
         rows = raw
     return [_row_to_bar(r) for r in rows]
