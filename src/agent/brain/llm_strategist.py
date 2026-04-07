@@ -236,6 +236,33 @@ class Critique:
     weakness: str
 
 
+class StrategistLike(Protocol):
+    """Duck-typed shape that `SelfCritiquingStrategist` wraps. Both
+    `LLMStrategist` (anthropic SDK) and `ClaudeCodeStrategist` (local CLI)
+    satisfy this without inheritance."""
+
+    model: str
+
+    def decide(
+        self,
+        *,
+        symbol: Symbol,
+        price: float,
+        signals: dict[str, float],
+        portfolio: dict[str, Any],
+        recent_decisions: list[dict[str, Any]] | None = None,
+    ) -> Decision: ...
+
+    def critique(
+        self,
+        decision: Decision,
+        *,
+        price: float,
+        signals: dict[str, float],
+        portfolio: dict[str, Any],
+    ) -> "Critique": ...
+
+
 class SelfCritiquingStrategist:
     """
     Two-pass strategist: run the base strategist, then ask the same brain to
@@ -246,7 +273,7 @@ class SelfCritiquingStrategist:
     HOLDs from the base pass are returned untouched (nothing to critique).
     """
 
-    def __init__(self, base: LLMStrategist) -> None:
+    def __init__(self, base: StrategistLike) -> None:
         self.base = base
         self.model = base.model
 

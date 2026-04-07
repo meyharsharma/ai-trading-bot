@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import base64
 import logging
+import os
 import signal
 import sys
 from dataclasses import dataclass
@@ -36,6 +37,11 @@ from typing import Any
 
 import yaml
 
+from agent.brain.claude_code_strategist import (
+    ClaudeCodeConfig,
+    ClaudeCodeStrategist,
+    is_available as claude_cli_available,
+)
 from agent.brain.llm_strategist import LLMStrategist, SelfCritiquingStrategist
 from agent.chain import (
     ArtifactsClient,
@@ -152,18 +158,35 @@ async def build_runtime(
     tools = KrakenTools(mcp_client)
     feed = KrakenFeed(tools)
 
-    # Brain — Claude via the anthropic SDK. Lazy import so the loop runs in
-    # tests with a fake client without requiring the SDK to be present.
-    if anthropic_client is None:
-        from anthropic import Anthropic  # type: ignore
+    # Brain — two paths:
+    #   1. ANTHROPIC_API_KEY set → use the SDK directly (fastest, no subprocess
+    #      overhead, useful for backtests and CI). The caller can also inject
+    #      a fake client for tests.
+    #   2. Otherwise, if the local `claude` CLI is on PATH → reuse the user's
+    #      Claude Code OAuth credentials by shelling out per cycle. This is
+    #      the default path during the hackathon: no API key, no billing setup.
+    base: LLMStrategist | ClaudeCodeStrategist
+    if anthropic_client is not None or os.getenv("ANTHROPIC_API_KEY"):
+        if anthropic_client is None:
+            from anthropic import Anthropic  # type: ignore
 
-        anthropic_client = Anthropic()
-    base = LLMStrategist(
-        anthropic_client,
-        model=cfg.llm_model,
-        max_tokens=cfg.llm_max_tokens,
-        temperature=cfg.llm_temperature,
-    )
+            anthropic_client = Anthropic()
+        base = LLMStrategist(
+            anthropic_client,
+            model=cfg.llm_model,
+            max_tokens=cfg.llm_max_tokens,
+            temperature=cfg.llm_temperature,
+        )
+    elif claude_cli_available():
+        log.info("using local `claude` CLI as the strategist (no API key)")
+        base = ClaudeCodeStrategist(
+            ClaudeCodeConfig(model=cfg.llm_model)
+        )
+    else:
+        raise RuntimeError(
+            "no LLM brain available — set ANTHROPIC_API_KEY or install the "
+            "`claude` CLI (https://docs.claude.com/claude-code)"
+        )
     strategist = SelfCritiquingStrategist(base)
 
     # Risk gate — pure Python, no I/O.
