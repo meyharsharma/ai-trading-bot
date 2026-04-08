@@ -18,5 +18,3 @@ node_modules/
 .idea/
 .vscode/
 data/cache/
-*.sqlite
-*.db
